@@ -1,0 +1,666 @@
+---
+title: "proj2"
+author: "Jules Stacy"
+date: "March 3, 2020"
+output: html_document
+---
+
+#Attrition and Salary Predictions using Regression and Machine Learning
+
+This project attempts to answer two questions:
+1. Given a variety of factors, how likely is it for any given employee to leave their current company? And can we predict this?
+2. Given a variety of factors, are we able to predict a given employee's salary?
+
+There are three datasets provided:
+CaseStudy2-data.csv: A large selection of observations with all data included
+CaseStudy2CompSet No Salary.csv: 300 observations with all data except for MonthlyIncome
+CaseStudy2CompSet No Attrition.csv: 300 observations with all data except for Attrition
+
+Finally, some observations drawn from the data will be provided as additional analysis.
+
+All code used for analysis is included in this document, and all data and files will be made available in the git repository located at: https://github.com/jules-stacy/CaseStudy2DDS.git
+
+
+Load Libraries
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+invisible(library(tidyverse))
+invisible(library(caret))
+invisible(library(class))
+invisible(library(dummies))
+invisible(library(e1071))
+invisible(library(MASS))
+invisible(library(ggplot2))
+invisible(library(GGally))
+```
+
+Import Data
+```{r}
+#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+train = read.csv("./Data/CaseStudy2-data.csv")
+comps = read.csv("./Data/CaseStudy2CompSet No Salary.csv")
+compa = read.csv("./Data/CaseStudy2CompSet No Attrition.csv")
+```
+
+NA and Levels Check
+```{r}
+#check for NA values
+#sum(is.na(train))
+#sum(is.na(comps))
+#sum(is.na(compa))
+
+#Data seems to be clean of NA values. Checking some levels
+#names(train)
+#levels(train$Attrition)
+#levels(train$Department)
+#levels(train$EducationField)
+#levels(train$JobRole)
+#levels(train$MaritalStatus)
+#levels(train$BusinessTravel)
+
+#levels(comps$Attrition)
+#levels(comps$Department)
+#levels(comps$EducationField)
+#levels(comps$JobRole)
+#levels(comps$MaritalStatus)
+#levels(comps$BusinessTravel)
+
+#levels(compa$Department)
+#levels(compa$EducationField)
+#levels(compa$JobRole)
+#levels(compa$MaritalStatus)
+#levels(compa$BusinessTravel)
+```
+
+
+Upon further review of the data, there is some additional setup that needs to be done. There are a number of categorical variables with ratings from 1 to 4 that need to be set as factors. And for screening tests there need to be two lists, one for factors and another for numerics. Finally there are three junk variables which feature a single column of one repeated value, which need to be removed.
+
+Factor Setting, begin data cleaning
+```{r warning=FALSE, message=FALSE}
+#Getting data for Attrition Prediction
+colnames(comps)[1] <- "ID"
+attrition_train <- merge(train, comps, all=TRUE)
+
+
+inputdata=attrition_train
+#Data was pre-cleaned, missing monthly income values from comps set
+#iterate through variable names to set factors
+for(i in 1:length(names(inputdata))){
+  varb=names(inputdata[i])
+  #set factor variables based on character
+  if(!is.numeric(inputdata[3, varb])){
+    inputdata[,varb] <- as.factor(inputdata[,varb])
+  }
+}
+
+drop <- c("EmployeeCount", "StandardHours", "Over18")
+inputdata <- inputdata[,!(names(inputdata) %in% drop)]
+
+inputdata$PerformanceRating <- as.factor(inputdata$PerformanceRating)
+inputdata$Education <- as.factor(inputdata$Education)
+inputdata$EnvironmentSatisfaction <- as.factor(inputdata$EnvironmentSatisfaction)
+inputdata$JobInvolvement <- as.factor(inputdata$JobInvolvement)
+inputdata$JobSatisfaction <- as.factor(inputdata$JobSatisfaction)
+inputdata$RelationshipSatisfaction <- as.factor(inputdata$RelationshipSatisfaction)
+inputdata$StockOptionLevel <- as.factor(inputdata$StockOptionLevel)
+inputdata$WorkLifeBalance <- as.factor(inputdata$WorkLifeBalance)
+
+#Debugging Block
+factor_check <- lapply(inputdata, is.factor)
+factor_logic <- as.logical(factor_check)
+factor_numeric <- !factor_logic
+trainfactors <- inputdata[,factor_logic]
+trainnumerics <- inputdata[,factor_numeric]
+factor_vars<- names(trainfactors)
+numeric_vars <- names(trainnumerics)
+
+#adjust for over-representation
+#Because of the number of no vs. yes responses from attrition, we must resample our data to eliminate bias posed by over-representation from "no" cases.
+invisible(sum(inputdata$Attrition=="No")) #979 cases
+invisible(sum(inputdata$Attrition=="Yes")) #191 cases
+no_attr <- inputdata[inputdata$Attrition=="No",]
+yes_attr <- inputdata[inputdata$Attrition=="Yes",]
+no_attr <- no_attr[sample(nrow(no_attr), size=191),]
+inputdata <- merge(no_attr, yes_attr, all=TRUE)
+
+
+#Create dataframe with all encoded dummy variables
+invisible(dummy.df <- dummy.data.frame(inputdata, sep = "."))
+dummy.df$Attrition <- inputdata$Attrition
+
+```
+ 
+ Because there were 979 cases were there was no attrition and 191 cases where there was attrition, the no cases were over-represented in the dataset. As a result the data had to be randomly resampled to balance the number of no and yes cases. The end result is a dataset with 382 observations, half of which are yes cases.
+
+With a total of 32 variables, it is time to narrow down which variables we will look at. KNN does not do well with a large number of predictor variables. And Naive Bayes assumes independence from variable to variable despite there being variables that are potentially related in this dataset. Further complicating this, there was at least one nominal categorical variable that had to be recoded. Thus, a dataframe containing individual variables for each nominal category had to be created, bringing the total number of independent variables up to 76.
+
+For efficiency, the variables will be narrowed down. Since categorical variables feature heavily in this analysis, a chi-square test will be run for ever comparison to Attrition Rate, and variable relationships will be screened out based on p-values. A reference level of alpha=0.05 will be used.
+
+Variable Selection: First Screening
+```{r warning=FALSE}
+#narrow down variables with Chi-Squared and Phi Correlation
+#initialize vectors
+p.list <- c()
+var.list<- c()
+phi.list<- c()
+sig.list <- c()
+
+#set the threshold for variable inclusion
+alpha <- 0.05
+
+#Perform AOV on numeric variables vs. attrition rate
+for(i in 1:(length(names(dummy.df)))){
+  
+  #build a temporary model
+  Xsq <- invisible(chisq.test(dummy.df$Attrition, dummy.df[,i]))
+  #fetch the p-value
+  pval <- Xsq$p.value
+  Xsq.stat <- Xsq$statistic
+  
+  #build list of variables based on p-value threshold
+  #also calculate the phi coefficient for effect size
+  if(pval < alpha){
+    sig.list <- c(sig.list, names(dummy.df[i]))
+    phi.stat <- sqrt(Xsq.stat/nrow(dummy.df))
+    
+    if(phi.stat > 0.25){
+      phi.list <- c(phi.list, phi.stat)  
+      p.list <- c(p.list, format(pval))
+      var.list <- c(var.list, names(dummy.df[i]))
+    }
+
+  }
+}
+
+
+
+#Display data, Remove Attrition from Variable List
+var.list
+p.list
+unname(phi.list)
+
+#build variable lists for plotting and analysis
+skiplist <- c("Attrition", "Attrition.No", "Attrition.Yes", "OverTime.No")
+sig.list <- sig.list[!sig.list %in% skiplist]
+var.list <- var.list[!var.list %in% skiplist]
+```
+Above is a list of variables that have passed the alpha threshold of 0.1, and then passed a phi correlation threshold of 0.25. The phi correlation is similar to the pearson correlation coefficient. For reference, Attrition vs. Attrition was included and scored a 99.57% (almost 100%). Variables with the highest phi coefficients will be selected for model fitting.
+
+The following have the greatest effect (measured with phi) on Attrition Rate from this list:
+
+Age, JobLevel, OverTime, TotalWorkingYears, YearsAtCompany, YearsInCurrentRole, and YearsWithCurrManager.
+
+These have been selected based on a cutoff of 0.25. This number was selected to be relatively high in the range of phi correlation values while allowing enough variables for modeling.
+
+
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+p1 <- dummy.df %>%
+  dplyr::select(Attrition, sig.list) %>%
+  ggpairs(mapping=aes(fill=Attrition, color=Attrition, alpha=0.5)) +
+  #labels
+  labs(title = "Multi-Variable Plot Matrix",
+       subtitle = "Crossplot of All Significant Variables",
+       caption = "Red = Stay, Green = Leave       Source: CaseStudy2-data.csv \nAuthor: Jules Stacy")
+
+#p1
+```
+Visually from p1 (not rendered via code), there are some factors that immediately show that an employee is more likely to leave a company than stay. These factors are:
+No travel for business
+Lowest possible job level
+Job satisfaction lower than 4
+Overtime work
+No stock options
+Being single (relationship status)
+Having been at the company less than 2.5 years
+Having been in their current role less than 2.5 years
+Having worked with their current manager less than 2 years
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+#A crossplot of influential variables
+p2 <- dummy.df %>%
+  dplyr::select(Attrition, var.list) %>%
+  ggpairs(mapping=aes(fill=inputdata$Attrition, alpha=0.5)) +
+  #labels
+  labs(title = "Multi-Variable Plot Matrix",
+       subtitle = "Crossplot of Influential Variables",
+       caption = "Source: CaseStudy2-data.csv \nAuthor: Jules Stacy")
+
+p2
+
+```
+
+The graph is arranged so that Attrition is both the first row and first column. People who leave their jobs are represented by the green colors on the graph, and people who don't leave their jobs are represented by red colors on the graph.
+
+Some items that immediately jump out:
+Employees that work overtime are more likely to leave their jobs
+Individuals with a new manager are more likely to leave their jobs, but after about two years working with their manager they are less likely to leave overall
+Employees in a new role are more likely to leave their jobs, but after about two years working in this role they are less likely to leave overall
+Employees at a new company are more likely to leave their jobs in the first two years
+Individuals who are younger tend to be more likely to leave their jobs
+Living closeby translates into employees not leaving their jobs
+Employees at the base job level are more likely to leave their job
+Employees with no stock options are more likely to leave their jobs
+```{r}
+normalize.df <- dummy.df[,c("Attrition", var.list)]
+
+#normalize data: all data falls between zero and one to remove bias from large numbers
+for(i in names(normalize.df)){
+  tempcol <- as.double(normalize.df[,i]) #some of them wanted to stay factors
+  tempcol <- as.numeric(tempcol) #this is redundant but it works the way I want
+  normalize.df[,i]<- (tempcol-min(tempcol))/(max(tempcol)-min(tempcol))
+  }
+
+#Attrition Column: 0=No, 1=Yes
+```
+
+The chosen variables will be tested using K-nearest-neighbor testing to predict classifications for a set of points for whom Attrition is unknown.
+
+K-nearest Neighbor testing is a method of predicting outcomes where a sample is compared to k number of its nearest neighbors, and the most prolific scenario of that group is then chosen as the category for the sample. For example, a sample point will be chosen and 5 nearest neighbors will be compared to see if there are more "Yes" or "No" responses among the neighbors; if there are more "Yes" responses, the sample point will be classified as "Yes."
+
+Train-and-test testing is a method where a dataset of known responses is randomly divided into a training set upon which a model is built, and then that model is validated on the test set before full deployment on a set where responses are not known.
+
+Leave-one-out testing is a method where a dataset of known responses is tested one at a time against itself, and validated internally before full deployment on a set where responses are not known.
+
+The first step is determining the optimal number of comparison neighbors, which will be determined using hyperparameter testing (or, average accuracies over a lot of loops).
+```{r warning=TRUE, message=TRUE, echo=TRUE}
+#dataframe for analysis
+#Arrange your dataframe so the response variable is in column one
+k.data <- normalize.df 
+
+#define some other variables before running the loops
+kmax=25
+loops=100
+
+
+#Preallocated dataframes and other indicators
+accs1 = data.frame(k = numeric(kmax), accuracy = numeric(kmax), accuracy2=numeric(kmax))
+accs2 = data.frame(k = numeric(kmax), accuracy = numeric(kmax), accuracy2=numeric(kmax))
+ncolumn<- length(k.data)
+
+#time to determine optimal k values
+
+#-----define loop-----
+#housed processes to speed compile time
+#each loop processes train vs test and then icv
+for(j in 1:loops){
+  train.k <- k.data[sample(nrow(k.data), size=(nrow(k.data)*(2/3))),]
+  test.k <- setdiff(k.data, train.k)
+for(i in 1:kmax)
+{
+  #KNN using train and test sets
+  classifications1 = knn(train.k[,c(2:ncolumn)],test.k[,c(2:ncolumn)],train.k[,1], prob = TRUE, k = i)
+  #results table
+  sur1 = table(test.k[,1],classifications1) 
+  #confusion matrix
+  CM1 = confusionMatrix(sur1) 
+  accs1$accuracy[i] = accs1$accuracy[i] + CM1$overall[1]
+  accs1$k[i] = i
+  
+  #KNN using leave-one-out analysis
+  classifications2 = knn.cv(k.data[,c(2:ncolumn)], k.data[,1], prob=TRUE, k=i)
+  #results table
+  sur2 = table(k.data[,1],classifications2) 
+  #confusion matrix
+  CM2 = confusionMatrix(sur2) 
+  accs2$accuracy[i] = accs2$accuracy[i] + CM2$overall[1]
+  accs2$k[i] = i
+  
+  }
+}
+
+#finish the calculation of averages
+accs1$accuracy <- accs1$accuracy/loops
+accs2$accuracy <- accs2$accuracy/loops
+
+#-----build plots-----
+p3 <- ggplot(data=accs1, aes(x=k, y=accuracy)) +
+  geom_point() +
+  geom_text(aes(label=accs1$k), hjust=-.2, size=2.7)+
+  labs(title = "Figure 7",
+       subtitle = "Train and Test Hyperparameter K: 100 Iterations",
+       caption = "Source: CaseStudy2-data.csv \nAuthor: Jules Stacy",
+       x = "Hyperparameter K",
+       y = "Average Accuracy")
+
+p4 <- ggplot(data=accs2, aes(x=k, y=accuracy)) +
+  geom_point() +
+  geom_text(aes(label=accs2$k), hjust=-.2, size=2.7)+
+  labs(title = "Figure 8",
+       subtitle = "Leave One Out Hyperparameter K: 100 Iterations",
+       caption = "Source: CaseStudy2-data.csv \nAuthor: Jules Stacy",
+       x = "Hyperparameter K",
+       y = "Average Accuracy")
+
+
+p3
+```
+
+The above graphic displays a graph of hyperparameter k-values for the purposes of choosing the most optimal k-value for testing. This graph was generated based on 100 sets of randomly generated train and test data.
+
+Because train and test sets are randomized every time this chunk of code is run, accuracy values may have changed and another k-value may make more contextual sense; however as of the time of this analysis, k=13 has a decently high accuracy at greater than 64% while not having too many datapoints to cause overfitting and while being an odd number.
+
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+p4
+```
+
+The above graphic is a graph of hyperparameter k-values for the purpose of choosing the most optimal k-value for testing. This graph was generated based on 100 sets of leave-one-out k-nearest-neighbor tests on the entire initial training set.
+
+Because train and test sets are randomized every time this chunk of code is run, accuracy values may have changed and another k-value may make more contextual sense; however as of the time of this analysis, k=13 has a decently high accuracy at approximately 65% while not having too many datapoints to cause overfitting and while being an odd number.
+
+```{r}
+#define k-values and possibly other variables
+k1=13
+k2=13
+train.k <- k.data[sample(nrow(k.data), size=(nrow(k.data)*(2/3))),]
+test.k <- setdiff(k.data, train.k)
+
+
+#code for test and train
+  knn_tnt = knn(train.k[,c(2:ncolumn)],test.k[,c(2:ncolumn)],train.k[,1], prob = TRUE, k = k1)
+  #results table
+  sur1 = table(test.k[,1],knn_tnt) 
+  #confusion matrix
+  CM1 = confusionMatrix(sur1) 
+
+#code for leave one out
+  knn_loo = knn.cv(k.data[,c(2:ncolumn)], k.data[,1], prob=TRUE, k=k2)
+  #results table
+  sur2 = table(k.data[,1],knn_loo) 
+  #confusion matrix
+  CM2 = confusionMatrix(sur2) 
+
+
+```
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+CM1
+```
+Above is the result of the train-and-test knn process. 
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+CM2
+```
+----------------------------------------
+Above is the result of the leave-one-out knn process. This one tends to result in higher accuracy, specificity, and sensitivity than the train-and-test method.
+
+Below, the knn model is fitted to the competition data using combined train and test data from above, and attrition is predicted for each individual. This process is similar to a mesh of the above two methods, where leave-one-out is run on the combined train and test from above, and then the competition set is plugged in as the test data set.
+
+```{r warning=FALSE, message=FALSE}
+#==========Prep competition:attrition dataset for predictions==============
+#Data was pre-cleaned, no NA values
+#iterate through variable names to set factors
+inputdata=compa
+for(i in 1:length(names(inputdata))){
+  varb=names(inputdata[i])
+  #set factor variables based on character
+  if(!is.numeric(inputdata[3, varb])){
+    inputdata[,varb] <- as.factor(inputdata[,varb])
+  }
+}
+
+drop <- c("EmployeeCount", "StandardHours", "Over18") #vars with one level
+inputdata <- inputdata[,!(names(inputdata) %in% drop)]
+
+#set factors
+inputdata$PerformanceRating <- as.factor(inputdata$PerformanceRating)
+inputdata$Education <- as.factor(inputdata$Education)
+inputdata$EnvironmentSatisfaction <- as.factor(inputdata$EnvironmentSatisfaction)
+inputdata$JobInvolvement <- as.factor(inputdata$JobInvolvement)
+inputdata$JobSatisfaction <- as.factor(inputdata$JobSatisfaction)
+inputdata$RelationshipSatisfaction <- as.factor(inputdata$RelationshipSatisfaction)
+inputdata$StockOptionLevel <- as.factor(inputdata$StockOptionLevel)
+inputdata$WorkLifeBalance <- as.factor(inputdata$WorkLifeBalance)
+
+#Create dataframe with all encoded dummy variables
+invisible(dummy.df <- dummy.data.frame(inputdata, sep = "."))
+#no Attrition in compa set
+
+
+#================normalize data============
+#specify variables for selection
+normalize.df <- dummy.df[,var.list]
+
+#normalize data: all data falls between zero and one to remove bias from large numbers
+for(i in names(normalize.df)){
+  tempcol <- as.double(normalize.df[,i]) #some of them wanted to stay factors
+  tempcol <- as.numeric(tempcol) #this is redundant but it works the way I want
+  normalize.df[,i]<- (tempcol-min(tempcol))/(max(tempcol)-min(tempcol))
+  }
+
+
+#===========Predict using model 2 (leave one out)====================
+ncolumn2<- length(k.data)
+results = knn(k.data[,c(2:ncolumn2)],normalize.df,k.data$Attrition, prob = TRUE, k = 13)
+
+#===========Package and ship it=======================
+predict <- as.data.frame(results)
+predict$ID <- compa$ID                #add ID column
+predict <- predict[,c(2,1)]           #reorder columns
+colnames(predict)[2] <- "Attrition"   #rename prediction column
+#Attrition Column: 0=No, 1=Yes
+levels(predict$Attrition) <- c("No", "Yes") #fix levels
+#write.csv(predict, "./Data/Case2PredictionsStacy Attrition.csv")
+
+```
+
+
+
+================================================================================
+================================================================================
+================================================================================
+================================================================================
+
+Problem 2:
+What factors predict the salaries of employees?
+
+
+
+
+First a dataframe is built where all available salary information is included and a dummy dataframe is generated. This allows separation of employees by job role, department, business travel, and other factors.
+
+
+```{r warning=FALSE}
+#Getting data for Salary Prediction
+salary_train <- merge(train, compa, all=TRUE)
+inputdata <- salary_train
+
+#Data was pre-cleaned, missing monthly income values from comps set
+#iterate through variable names to set factors
+for(i in 1:length(names(inputdata))){
+  varb=names(inputdata[i])
+  #set factor variables based on character
+  if(!is.numeric(inputdata[3, varb])){
+    inputdata[,varb] <- as.factor(inputdata[,varb])
+  }
+}
+
+drop <- c("EmployeeCount", "StandardHours", "Over18")
+inputdata <- inputdata[,!(names(inputdata) %in% drop)]
+
+inputdata$PerformanceRating <- as.factor(inputdata$PerformanceRating)
+inputdata$Education <- as.factor(inputdata$Education)
+inputdata$EnvironmentSatisfaction <- as.factor(inputdata$EnvironmentSatisfaction)
+inputdata$JobInvolvement <- as.factor(inputdata$JobInvolvement)
+inputdata$JobSatisfaction <- as.factor(inputdata$JobSatisfaction)
+inputdata$RelationshipSatisfaction <- as.factor(inputdata$RelationshipSatisfaction)
+inputdata$StockOptionLevel <- as.factor(inputdata$StockOptionLevel)
+inputdata$WorkLifeBalance <- as.factor(inputdata$WorkLifeBalance)
+
+#Debugging Block
+factor_check <- lapply(inputdata, is.factor)
+factor_logic <- as.logical(factor_check)
+factor_numeric <- !factor_logic
+trainfactors <- inputdata[,factor_logic]
+trainnumerics <- inputdata[,factor_numeric]
+factor_vars<- names(trainfactors)
+numeric_vars <- names(trainnumerics)
+
+
+#Create dataframe with all encoded dummy variables
+invisible(dummy.df <- dummy.data.frame(inputdata, sep = "."))
+
+```
+
+With more than 70 variables available for analysis we must narrow it down. 
+
+Variables will first be screened out using p-value: 
+
+```{r warning=FALSE}
+#selection of variables for salary regression
+#narrow down variables with Chi-Squared and Phi Correlation
+#Set target variable
+#initialize vectors
+p.list <- c()
+var.list<- c()
+arsq.list<- c()
+sig.list <- c()
+
+#set the threshold for variable inclusion
+alpha <- 0.05
+threshold.adj.r <- 0.1
+
+#Perform AOV on numeric variables vs. attrition rate
+for(i in 2:(length(names(dummy.df)))){
+  #~~~Adj-R-Squared using LM~~~
+  #build a temporary model
+  linmod <- lm(MonthlyIncome~dummy.df[,i], data=dummy.df)
+  #grab adj rsq
+  arsq <- summary(linmod)$adj.r.squared
+  pval <- summary(linmod)$coefficients[8]
+  
+  
+  #build list of variables based on p-val and adj rsq threshold
+  #also calculate the phi coefficient for effect size
+  if(pval < alpha){
+    sig.list <- c(sig.list, names(dummy.df[i]))
+    if(arsq > threshold.adj.r){
+      arsq.list <- c(arsq.list, arsq)  
+      p.list <- c(p.list, format(pval))
+      var.list <- c(var.list, names(dummy.df[i]))
+    }
+
+  }
+}
+
+
+
+#Display data, Remove Attrition from Variable List
+var.list
+p.list
+arsq.list
+
+skiplist = c("MontlyIncome")
+var.list <- var.list[!var.list %in% skiplist]
+
+
+```
+
+Above are the variables selected as significant by the model which have a high enough adjusted r squared to clear the threshold of 0.3.
+
+After screening out all other variables, we find that the variables that most strongly correlate to income are: JobLevel and TotalWorkingYears.
+
+In other words having a higher job role and working for more years correlate best to the salary earned by an individual. In fact, JobLevel alone is enough to explain 91% of the variance in monthly income. Because I cannot assume that this will carry over to the trial data, I will include TotalWorkingYears to compensate for potential skew (intentional or otherwise) that was given to us in the train data.
+
+However, this does not mean that there are no other variables that explain income. For instance, when we look at the graph below we can see that having a job as a lab technician or a research scientist corresponds to a negative effect on monthly income (in other words, those professions are paid less), and have a job role as a manager corresponds to a positive correlation as well.
+
+We will move forward with a computer-selected model based on these variables. 
+
+```{r echo=FALSE, message=FALSE}
+p5 <- dummy.df %>%
+  dplyr::select(c("MonthlyIncome", var.list)) %>%
+  ggpairs( ) +
+  #labels
+  labs(title = "Multi-Variable Plot Matrix",
+       subtitle = "Crossplot of Influential Variables",
+       caption = "Source: CaseStudy2-data.csv \nAuthor: Jules Stacy")
+
+#p5
+
+```
+
+
+
+```{r}
+#
+modeling.df <- dummy.df[,var.list]
+colnames(modeling.df) <- c("Age", "JobLevel", "JobRole.Technician", "JobRole.Manager", "JobRole.Director", "JobRole.Scientist", "MonthlyIncome", "TotalWorkingYears", "YearsAtCompany", "YearsInCurrentRole", "YearsSinceLastPromotion", "YearsWithCurrManager")
+
+
+lmodel <- glm(MonthlyIncome~JobLevel*TotalWorkingYears+Age*JobLevel+JobRole.Technician*JobRole.Manager*JobRole.Director*JobRole.Scientist+YearsSinceLastPromotion*YearsWithCurrManager+YearsAtCompany, data=modeling.df) %>% stepAIC(trace=FALSE)
+summary(lmodel)
+```
+
+The above readout shows the summary of the fitted model and the list of final chosen variables. To recap the process so far, first all possible variables were filtered based on statistical significance. Statistically significant variables were then filtered based on their respective adjusted-r-squared values to ensure that they explained enough of the variance in MonthlyIncome. Finally, stepwise selection was run in order to choose the final variables that would be used for modeling.
+
+The goal of stepwise selection was to minimize the AIC, which is a similar metric to the R-squared measurement. The above model was the best model chosen by the computer, resulting in 9 variables (including many different job roles). We can see that some of the effects that cause an employee to lose monthly income are being a lab technician or research scientist, and working with their current manager longer. This last one is a particularly nasty one because as we found earlier, the more time an employee spends working with the same manager, the less likely they are to leave the company they work at.
+
+We can compare this model to the below model, which shows MonthlyIncome compared to job level. Please recall that JobLevel alone had an amazing r-squared value at over 90%. The above model is still found to be a better model at predicting monthly income, as it has a smaller AIC by a measurement of approximately 600.
+
+```{r}
+
+model <- glm(MonthlyIncome~JobLevel, data=modeling.df) %>% stepAIC(trace=FALSE)
+summary(model)
+
+```
+
+
+```{r warning=FALSE, message=FALSE}
+#Predict, Package, and Ship Salary Data for the competition set
+inputdata <- comps
+
+#Data was pre-cleaned, missing monthly income values from comps set
+#iterate through variable names to set factors
+for(i in 1:length(names(inputdata))){
+  varb=names(inputdata[i])
+  #set factor variables based on character
+  if(!is.numeric(inputdata[3, varb])){
+    inputdata[,varb] <- as.factor(inputdata[,varb])
+  }
+}
+
+drop <- c("EmployeeCount", "StandardHours", "Over18")
+inputdata <- inputdata[,!(names(inputdata) %in% drop)]
+
+inputdata$PerformanceRating <- as.factor(inputdata$PerformanceRating)
+inputdata$Education <- as.factor(inputdata$Education)
+inputdata$EnvironmentSatisfaction <- as.factor(inputdata$EnvironmentSatisfaction)
+inputdata$JobInvolvement <- as.factor(inputdata$JobInvolvement)
+inputdata$JobSatisfaction <- as.factor(inputdata$JobSatisfaction)
+inputdata$RelationshipSatisfaction <- as.factor(inputdata$RelationshipSatisfaction)
+inputdata$StockOptionLevel <- as.factor(inputdata$StockOptionLevel)
+inputdata$WorkLifeBalance <- as.factor(inputdata$WorkLifeBalance)
+
+#Debugging Block
+factor_check <- lapply(inputdata, is.factor)
+factor_logic <- as.logical(factor_check)
+factor_numeric <- !factor_logic
+trainfactors <- inputdata[,factor_logic]
+trainnumerics <- inputdata[,factor_numeric]
+factor_vars<- names(trainfactors)
+numeric_vars <- names(trainnumerics)
+
+
+#Create dataframe with all encoded dummy variables
+invisible(dummy.df <- dummy.data.frame(inputdata, sep = "."))
+
+var.list <- var.list[var.list!="MonthlyIncome"]
+modeling.df <- dummy.df[,var.list]
+colnames(modeling.df) <- c("Age", "JobLevel", "JobRole.Technician", "JobRole.Manager", "JobRole.Director", "JobRole.Scientist", "TotalWorkingYears", "YearsAtCompany", "YearsInCurrentRole", "YearsSinceLastPromotion", "YearsWithCurrManager")
+
+lm.predictions <- as.data.frame(predict(lmodel, newdata=modeling.df))
+colnames(lm.predictions) = c("MonthlyIncome")
+lm.predictions$ID <- comps$ID
+lm.predictions <- lm.predictions[,c(2,1)]
+
+
+#write.csv(lm.predictions, "./Data/Case2PredictionsStacy Salary.csv")
+
+
+```
+
+
+
+
