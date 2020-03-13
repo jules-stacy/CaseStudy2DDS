@@ -447,7 +447,7 @@ predict <- predict[,c(2,1)]           #reorder columns
 colnames(predict)[2] <- "Attrition"   #rename prediction column
 #Attrition Column: 0=No, 1=Yes
 levels(predict$Attrition) <- c("No", "Yes") #fix levels
-#write.csv(predict, "./Data/Case2PredictionsStacy Attrition.csv")
+write.csv(predict, "./Predictions/Case2PredictionsStacy Attrition.csv")
 
 ```
 
@@ -553,10 +553,15 @@ for(i in 2:(length(names(dummy.df)))){
 
 
 #Display data, Remove Attrition from Variable List
+print("Variables:")
 var.list
+print("-------------------------------")
+print("P-values:")
 p.list
+print("-------------------------------")
+print("Adjusted R-Squared:")
 arsq.list
-
+print("-------------------------------")
 skiplist = c("MontlyIncome")
 var.list <- var.list[!var.list %in% skiplist]
 
@@ -582,7 +587,7 @@ p5 <- dummy.df %>%
        subtitle = "Crossplot of Influential Variables",
        caption = "Source: CaseStudy2-data.csv \nAuthor: Jules Stacy")
 
-#p5
+p5
 
 ```
 
@@ -661,7 +666,7 @@ lm.predictions$ID <- comps$ID
 lm.predictions <- lm.predictions[,c(2,1)]
 
 
-#write.csv(lm.predictions, "./Data/Case2PredictionsStacy Salary.csv")
+write.csv(lm.predictions, "./Predictions/Case2PredictionsStacy Salary.csv")
 
 
 ```
