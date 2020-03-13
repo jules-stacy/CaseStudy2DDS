@@ -174,8 +174,13 @@ for(i in 1:(length(names(dummy.df)))){
 
 
 #Display data, Remove Attrition from Variable List
+print("Variables:")
 var.list
+print("-------------------------------")
+print("P-values:")
 p.list
+print("-------------------------------")
+print("Phi Correlation:")
 unname(phi.list)
 
 #build variable lists for plotting and analysis
